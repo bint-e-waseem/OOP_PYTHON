@@ -1,0 +1,211 @@
+import weakref
+from datetime import datetime
+
+
+# =========================================================
+# 1. ConfigProfile — Flyweight via __new__ + WeakValueDictionary
+# =========================================================
+class ConfigProfile:
+    """
+    Caches one instance per (environment, region) key.
+    WeakValueDictionary ensures the cache entry disappears
+    when the caller drops the last strong reference.
+    """
+    _cache: "weakref.WeakValueDictionary[tuple, ConfigProfile]" = \
+        weakref.WeakValueDictionary()
+
+    def __new__(cls, environment: str, region: str, **kwargs):
+        key = (environment, region)
+
+        # Reuse cached instance if still alive
+        cached = cls._cache.get(key)
+        if cached is not None:
+            print(f"[__new__] REUSED cached ConfigProfile for {key}")
+            return cached
+
+        # Otherwise allocate a fresh instance
+        print(f"[__new__] ALLOCATING new ConfigProfile for {key}")
+        instance = super().__new__(cls)
+        cls._cache[key] = instance
+        return instance
+
+    def __init__(self, environment: str, region: str,
+                 timeout: int = 30, retries: int = 3):
+        # ---- GUARD: do NOT wipe state on a cached instance ----
+        if getattr(self, "_initialized", False):
+            print(f"[__init__] SKIPPED (already initialized) for "
+                  f"({self.environment}, {self.region})")
+            return
+
+        if not environment or not region:
+            raise ValueError("environment and region must be non-empty")
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
+
+        self.environment = environment
+        self.region = region
+        self.timeout = timeout
+        self.retries = retries
+        self._initialized = True
+        print(f"[__init__] INITIALIZED ({environment}, {region}, "
+              f"timeout={timeout})")
+
+    def __repr__(self):
+        return (f"ConfigProfile(env={self.environment!r}, "
+                f"region={self.region!r}, timeout={self.timeout})")
+
+
+# =========================================================
+# 2. SessionLease — Factory Constructors + Context Manager
+# =========================================================
+class SessionLease:
+    """
+    A managed lease representing an acquired resource.
+    Use as a context manager to guarantee release.
+
+    NOTE: __del__ exists only as a *last-resort* safety net —
+          it is NOT the primary cleanup mechanism (see explanation).
+    """
+
+    def __init__(self, owner: str, ttl_seconds: int = 60,
+                 lease_id: str | None = None):
+        if not isinstance(owner, str) or not owner.strip():
+            raise TypeError("owner must be a non-empty string")
+        if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive int")
+
+        self.owner = owner.strip()
+        self.ttl_seconds = ttl_seconds
+        self.lease_id = lease_id or f"{self.owner}-{id(self):x}"
+        self.acquired_at = datetime.now()
+        self.active = False
+        print(f"[SessionLease] Created lease '{self.lease_id}' "
+              f"(owner={self.owner}, ttl={ttl_seconds}s)")
+
+    # ---------- Factory constructors ----------
+    @classmethod
+    def from_env(cls, prefix: str, ttl_seconds: int = 60) -> "SessionLease":
+        """Build a lease from an environment-style prefix."""
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("prefix must be a non-empty string")
+        owner = f"{prefix.strip()}-worker"
+        return cls(owner=owner, ttl_seconds=ttl_seconds)
+
+    @classmethod
+    def ephemeral(cls, owner: str, ttl_seconds: int) -> "SessionLease":
+        """Short-lived lease; enforces a ceiling on TTL."""
+        if ttl_seconds > 300:
+            raise ValueError(
+                "ephemeral leases must have ttl_seconds <= 300")
+        lease = cls(owner=owner, ttl_seconds=ttl_seconds)
+        lease.lease_id = f"ephemeral-{lease.lease_id}"
+        return lease
+
+    # ---------- Lifecycle ----------
+    def acquire(self) -> "SessionLease":
+        if self.active:
+            raise RuntimeError(f"Lease '{self.lease_id}' already active")
+        self.active = True
+        print(f"[acquire] Lease '{self.lease_id}' ACTIVE")
+        return self
+
+    def release(self) -> None:
+        if not self.active:
+            print(f"[release] Lease '{self.lease_id}' already released (no-op)")
+            return
+        self.active = False
+        print(f"[release] Lease '{self.lease_id}' RELEASED")
+
+    # ---------- Context manager ----------
+    def __enter__(self) -> "SessionLease":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.release()
+        if exc_type is not None:
+            print(f"[__exit__] Exception propagated: {exc_type.__name__}: {exc}")
+        return False   # do not swallow exceptions
+
+    # ---------- Last-resort safety net (NOT primary cleanup) ----------
+    def __del__(self):
+        if getattr(self, "active", False):
+            print(f"[__del__] WARNING: lease '{self.lease_id}' "
+                  f"was still active at GC — releasing as last resort")
+
+
+# =========================================================
+# 3. DEMO
+# =========================================================
+def main():
+    print("=" * 70)
+    print("PART A: ConfigProfile flyweight cache")
+    print("=" * 70)
+
+    p1 = ConfigProfile("prod", "us-east", timeout=45)
+    p2 = ConfigProfile("prod", "us-east", timeout=999)   # reused
+    p3 = ConfigProfile("prod", "eu-west", timeout=30)    # new key
+
+    print("p1 is p2:", p1 is p2)          # True  (same cached object)
+    print("p1 is p3:", p1 is p3)          # False
+    print("p1.timeout preserved:", p1.timeout)  # 45 — NOT overwritten
+
+    print("\n-- Drop strong ref and re-create --")
+    del p2                                # p1 still alive → cache hit
+    p4 = ConfigProfile("prod", "us-east")
+    print("p1 is p4:", p1 is p4)          # True
+
+    print("\n-- Drop ALL strong refs, then re-create --")
+    del p1, p4
+    import gc; gc.collect()               # force weakref cleanup
+    p5 = ConfigProfile("prod", "us-east", timeout=77)
+    print("p5.timeout:", p5.timeout)      # 77 — brand-new allocation
+
+    print("\n" + "=" * 70)
+    print("PART B: SessionLease factories")
+    print("=" * 70)
+
+    lease_a = SessionLease.from_env("billing", ttl_seconds=120)
+    lease_b = SessionLease.ephemeral(owner="job-42", ttl_seconds=15)
+    print("A:", lease_a.lease_id, "| B:", lease_b.lease_id)
+
+    print("\n-- Invalid factory input --")
+    try:
+        SessionLease.ephemeral("job-99", ttl_seconds=9999)
+    except ValueError as e:
+        print("Rejected:", e)
+
+    try:
+        SessionLease(owner="", ttl_seconds=10)
+    except TypeError as e:
+        print("Rejected:", e)
+
+    print("\n" + "=" * 70)
+    print("PART C: Context manager — guaranteed release")
+    print("=" * 70)
+
+    with SessionLease(owner="worker-1", ttl_seconds=60) as lease:
+        print("Inside with, active =", lease.active)
+
+    print("After with, active =", lease.active)
+
+    print("\n-- Exception inside with: still released --")
+    try:
+        with SessionLease(owner="worker-2", ttl_seconds=60) as lease2:
+            print("Inside with, active =", lease2.active)
+            raise RuntimeError("simulated failure")
+    except RuntimeError as e:
+        print("Caught outside:", e)
+    print("After with, active =", lease2.active)
+
+    print("\n" + "=" * 70)
+    print("PART D: __del__ as LAST-RESORT only")
+    print("=" * 70)
+    leaked = SessionLease(owner="forgotten", ttl_seconds=30)
+    leaked.acquire()                     # never released explicitly
+    print("Leaked lease active =", leaked.active)
+    del leaked
+    import gc; gc.collect()              # triggers __del__ warning
+
+
+if __name__ == "__main__":
+    main()
