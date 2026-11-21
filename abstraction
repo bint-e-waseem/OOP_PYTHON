@@ -1,0 +1,130 @@
+"""notification_engine.py — ABC-based pluggable notification subsystem."""
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
+
+
+# ---------- Contracts ----------
+@dataclass(frozen=True)
+class NotificationPayload:
+    recipient: str
+    subject: str
+    body: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    success: bool
+    provider_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+# ---------- Abstraction ----------
+class NotificationChannel(ABC):
+    @property
+    @abstractmethod
+    def channel_type(self) -> str: ...
+
+    @abstractmethod
+    def send(self, payload: NotificationPayload) -> DeliveryResult: ...
+
+    def validate_payload(self, payload: NotificationPayload) -> Optional[str]:
+        if not payload.recipient or not payload.recipient.strip():
+            return "recipient is empty"
+        if not payload.body:
+            return "body is empty"
+        return None
+
+    def supports(self, channel_type: str) -> bool:
+        return self.channel_type == channel_type
+
+
+# ---------- Concrete channels ----------
+class EmailChannel(NotificationChannel):
+    def __init__(self, smtp_host="localhost", smtp_port=1025):
+        self._host, self._port = smtp_host, smtp_port
+
+    @property
+    def channel_type(self) -> str:
+        return "email"
+
+    def send(self, payload):
+        if (err := self.validate_payload(payload)):
+            return DeliveryResult(False, error=err)
+        # pretend SMTP works
+        return DeliveryResult(True, provider_id="email-ok")
+
+
+class SmsChannel(NotificationChannel):
+    MAX_LEN = 160
+
+    @property
+    def channel_type(self) -> str:
+        return "sms"
+
+    def send(self, payload):
+        if (err := self.validate_payload(payload)):
+            return DeliveryResult(False, error=err)
+        if len(payload.body) > self.MAX_LEN:
+            return DeliveryResult(False, error="body too long")
+        return DeliveryResult(True, provider_id="sms-ok")
+
+
+class WebhookChannel(NotificationChannel):
+    def __init__(self, endpoint_url):
+        self._url = endpoint_url
+
+    @property
+    def channel_type(self) -> str:
+        return "webhook"
+
+    def send(self, payload):
+        if (err := self.validate_payload(payload)):
+            return DeliveryResult(False, error=err)
+        return DeliveryResult(True, provider_id="wh-ok")
+
+
+class InMemoryChannel(NotificationChannel):
+    def __init__(self):
+        self.sent: list[NotificationPayload] = []
+
+    @property
+    def channel_type(self) -> str:
+        return "memory"
+
+    def send(self, payload):
+        if (err := self.validate_payload(payload)):
+            return DeliveryResult(False, error=err)
+        self.sent.append(payload)
+        return DeliveryResult(True, provider_id=f"mem-{len(self.sent)}")
+
+
+# ---------- Dispatcher + Service ----------
+class NotificationDispatcher:
+    def __init__(self, channels):
+        self._channels = {ch.channel_type: ch for ch in channels}
+
+    def register(self, channel: NotificationChannel) -> None:
+        self._channels[channel.channel_type] = channel
+
+    def notify(self, payload, channel_type) -> DeliveryResult:
+        ch = self._channels.get(channel_type)
+        if ch is None:
+            return DeliveryResult(False, error=f"no channel {channel_type!r}")
+        return ch.send(payload)
+
+
+class OrderService:
+    def __init__(self, dispatcher: NotificationDispatcher):
+        self._d = dispatcher
+
+    def ship_order(self, order_id, email, phone):
+        payload = NotificationPayload(
+            recipient=email,
+            subject=f"Order {order_id} shipped",
+            body=f"Order {order_id} is on its way!",
+            metadata={"order_id": order_id},
+        )
+        return self._d.notify(payload, "email")
