@@ -1,0 +1,157 @@
+"""Secure Ledger & Vault Engine — beginner-friendly reference implementation."""
+import hmac
+import hashlib
+import secrets
+import time
+from typing import Tuple
+
+
+class NonNegativeInt:
+    def __init__(self, name: str, minimum: int = 0):
+        self.name = name
+        self.minimum = minimum
+
+    def __set_name__(self, owner, name):
+        self.public_name = name
+        self.private_name = "_" + name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return getattr(obj, self.private_name)
+
+    def __set__(self, obj, value):
+        if isinstance(value, bool):
+            raise TypeError(f"{self.public_name} must be int, not bool")
+        if not isinstance(value, int):
+            raise TypeError(f"{self.public_name} must be int")
+        if value < self.minimum:
+            raise ValueError(f"{self.public_name} must be >= {self.minimum}")
+        object.__setattr__(obj, self.private_name, value)
+
+
+class CapabilityToken:
+    __slots__ = ("scope", "_used", "_expires_at", "_nonce")
+
+    def __init__(self, scope: str, ttl_seconds: int = 30):
+        self.scope = scope
+        self._used = False
+        self._expires_at = time.monotonic() + ttl_seconds
+        self._nonce = secrets.token_hex(8)
+
+    def is_valid(self) -> bool:
+        return (not self._used) and (time.monotonic() < self._expires_at)
+
+    def consume(self) -> None:
+        if not self.is_valid():
+            raise PermissionError("Capability token is expired or already used")
+        self._used = True
+
+
+class VaultAccount:
+    __slots__ = (
+        "_account_id",
+        "_salt",
+        "_VaultAccount__pin_hash",
+        "_balance",
+        "_daily_limit",
+        "_frozen",
+        "_spent_today",
+        "_VaultAccount__audit_log",
+        "__weakref__",
+    )
+
+    balance = NonNegativeInt("balance", minimum=0)
+    daily_limit = NonNegativeInt("daily_limit", minimum=0)
+
+    def __init__(self, account_id: str, pin: str, daily_limit: int = 100_000):
+        object.__setattr__(self, "_account_id", account_id)
+        self._salt = secrets.token_bytes(16)
+        self.__pin_hash = self._hash_pin(pin)
+        self.balance = 0
+        self.daily_limit = daily_limit
+        object.__setattr__(self, "_frozen", False)
+        object.__setattr__(self, "_spent_today", 0)
+        object.__setattr__(self, "_VaultAccount__audit_log", ())
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    @property
+    def audit_log(self) -> Tuple[str, ...]:
+        return self._VaultAccount__audit_log
+
+    @property
+    def pin_digest(self) -> str:
+        return hmac.new(self._salt, self.__pin_hash, hashlib.sha256).hexdigest()
+
+    def _hash_pin(self, pin: str) -> bytes:
+        return hmac.new(self._salt, pin.encode(), hashlib.sha256).digest()
+
+    def _verify_pin(self, pin: str) -> bool:
+        return hmac.compare_digest(self._hash_pin(pin), self.__pin_hash)
+
+    def _append_audit(self, entry: str) -> None:
+        object.__setattr__(
+            self, "_VaultAccount__audit_log",
+            self._VaultAccount__audit_log + (entry,),
+        )
+
+    def freeze(self, reason: str = "admin") -> None:
+        object.__setattr__(self, "_frozen", True)
+        self._append_audit(f"FROZEN reason={reason}")
+
+    def unfreeze(self, reason: str = "admin") -> None:
+        object.__setattr__(self, "_frozen", False)
+        self._append_audit(f"UNFROZEN reason={reason}")
+
+    def deposit(self, amount: int) -> None:
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise TypeError("amount must be int")
+        if amount <= 0:
+            raise ValueError("amount must be > 0")
+        self.balance = self.balance + amount
+        self._append_audit(f"DEPOSIT amount={amount} new_balance={self.balance}")
+
+    def authorize_transfer(self, amount: int, pin: str, token: CapabilityToken) -> None:
+        if self._frozen:
+            self._append_audit(f"REJECTED frozen amount={amount}")
+            raise PermissionError("Account is frozen")
+        if not token.is_valid():
+            self._append_audit(f"REJECTED bad_token amount={amount}")
+            raise PermissionError("Invalid or expired capability token")
+        if not self._verify_pin(pin):
+            self._append_audit(f"REJECTED bad_pin amount={amount}")
+            raise PermissionError("Invalid PIN")
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise TypeError("amount must be int")
+        if amount <= 0:
+            raise ValueError("amount must be > 0")
+        if amount > self.balance:
+            self._append_audit(f"REJECTED insufficient amount={amount}")
+            raise ValueError("Insufficient funds")
+        if amount > self.daily_limit:
+            self._append_audit(f"REJECTED daily_limit amount={amount}")
+            raise ValueError("Exceeds daily limit")
+        if self._spent_today + amount > self.daily_limit:
+            self._append_audit(f"REJECTED cumulative_limit amount={amount}")
+            raise ValueError("Exceeds cumulative daily limit")
+
+        token.consume()
+        self.balance = self.balance - amount
+        object.__setattr__(self, "_spent_today", self._spent_today + amount)
+        self._append_audit(f"TRANSFER amount={amount} new_balance={self.balance}")
+
+
+class SettlementController:
+    def __init__(self):
+        self._issued = 0
+
+    def issue_token(self, scope: str = "transfer") -> CapabilityToken:
+        self._issued += 1
+        return CapabilityToken(scope=scope, ttl_seconds=30)
