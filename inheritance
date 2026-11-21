@@ -1,0 +1,204 @@
+from datetime import datetime
+
+
+# =========================================================
+# 1. TIMESTAMP MIXIN  — cooperative __init__
+# =========================================================
+class TimestampMixin:
+    """Adds created_at / updated_at using cooperative __init__."""
+
+    def __init__(self, **kwargs):
+        # Pull nothing out — just pass everything down the MRO chain
+        super().__init__(**kwargs)
+        self.created_at = datetime.now()
+        self.updated_at = self.created_at
+
+    def touch(self):
+        """Update the timestamp whenever state changes."""
+        self.updated_at = datetime.now()
+
+
+# =========================================================
+# 2. AUDITABLE MIXIN  — cooperative method extension
+# =========================================================
+class AuditableMixin:
+    """Maintains an audit_trail and hooks into state transitions."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.audit_trail = []
+
+    def _audit(self, action: str, detail: str = ""):
+        entry = {
+            "action": action,
+            "detail": detail,
+            "at": datetime.now(),
+        }
+        self.audit_trail.append(entry)
+
+    # --- Hooks: extend the parent's behaviour, don't replace it ---
+    def submit(self):
+        result = super().submit()          # let the real submit run
+        if result["ok"]:
+            self._audit("submitted", f"doc_id={self.doc_id}")
+            if hasattr(self, "touch"):
+                self.touch()
+        return result
+
+    def approve(self):
+        # Only call super().approve if it exists (PolicyDocument does)
+        parent = getattr(super(), "approve", None)
+        if parent is None:
+            return {"ok": False, "msg": "approve() not supported"}
+        result = parent()
+        if result["ok"]:
+            self._audit("approved", f"doc_id={self.doc_id}")
+            if hasattr(self, "touch"):
+                self.touch()
+        return result
+
+
+# =========================================================
+# 3. BASE CLASS: Document
+# =========================================================
+class Document:
+    def __init__(self, doc_id: str, title: str, **kwargs):
+        super().__init__(**kwargs)          # keep MRO chain alive
+        self.doc_id = doc_id
+        self.title = title
+        self.status = "draft"
+
+    def submit(self):
+        """draft -> submitted"""
+        if self.status != "draft":
+            return {"ok": False,
+                    "msg": f"Cannot submit from '{self.status}'"}
+        self.status = "submitted"
+        return {"ok": True, "msg": "submitted"}
+
+    def summary(self) -> str:
+        return f"[{self.doc_id}] {self.title} — {self.status}"
+
+
+# =========================================================
+# 4. SUBCLASS: InvoiceDocument  — OVERRIDE + EXTEND
+# =========================================================
+class InvoiceDocument(Document):
+    def __init__(self, amount: float, currency: str = "USD", **kwargs):
+        super().__init__(**kwargs)
+        self.amount = amount
+        self.currency = currency
+
+    def submit(self):
+        # EXTEND: add a domain rule before delegating to super()
+        if self.amount <= 0:
+            return {"ok": False,
+                    "msg": "Invoice amount must be > 0"}
+        return super().submit()
+
+    def summary(self) -> str:
+        # OVERRIDE: custom summary (calls base for the prefix)
+        base = super().summary()
+        return f"{base} | {self.amount:.2f} {self.currency}"
+
+
+# =========================================================
+# 5. SUBCLASS: PolicyDocument — new state rule
+# =========================================================
+class PolicyDocument(Document):
+    def __init__(self, version: str, effective_date: str, **kwargs):
+        super().__init__(**kwargs)
+        self.version = version
+        self.effective_date = effective_date
+
+    def approve(self):
+        # Only allowed after submit()
+        if self.status != "submitted":
+            return {"ok": False,
+                    "msg": "Policy must be submitted before approval"}
+        self.status = "approved"
+        return {"ok": True, "msg": "approved"}
+
+    def summary(self) -> str:
+        base = super().summary()
+        return f"{base} | v{self.version} (eff. {self.effective_date})"
+
+
+# =========================================================
+# 6. COMBINED CLASS
+# =========================================================
+class AuditableInvoice(AuditableMixin, TimestampMixin,
+                       InvoiceDocument, Document):
+    """Mixin order matters:
+       AuditableMixin -> TimestampMixin -> InvoiceDocument -> Document
+    """
+    pass
+
+
+# =========================================================
+# 7. DEMO / main()
+# =========================================================
+def main():
+    print("=" * 70)
+    print("MRO FOR AuditableInvoice")
+    print("=" * 70)
+    for cls in AuditableInvoice.__mro__:
+        print(f"  {cls.__name__}")
+
+    print("\n" + "=" * 70)
+    print("CASE 1: Valid invoice submission + audit trail")
+    print("=" * 70)
+    inv = AuditableInvoice(
+        doc_id="INV-001",
+        title="Cloud Hosting Q3",
+        amount=1250.00,
+        currency="USD",
+    )
+    print("Initial :", inv.summary())
+    print("Status  :", inv.status)
+    print("Submit  :", inv.submit())
+    print("Summary :", inv.summary())
+    print("Audit   :", [e["action"] for e in inv.audit_trail])
+    print("Timestamps:",
+          "created_at <=", inv.created_at.time(),
+          "| updated_at >=", inv.updated_at.time(),
+          "| touched =", inv.updated_at > inv.created_at or "same-instant")
+
+    print("\n" + "=" * 70)
+    print("CASE 2: Invalid amount → blocked before state change")
+    print("=" * 70)
+    bad = AuditableInvoice(
+        doc_id="INV-002", title="Zero Invoice",
+        amount=0, currency="EUR",
+    )
+    print("Submit  :", bad.submit())
+    print("Status  :", bad.status)          # still draft
+    print("Audit   :", [e["action"] for e in bad.audit_trail])  # empty
+
+    print("\n" + "=" * 70)
+    print("CASE 3: PolicyDocument — approve before submit is rejected")
+    print("=" * 70)
+    pol = PolicyDocument(doc_id="POL-7", title="Data Retention",
+                         version="2.1", effective_date="2026-01-01")
+    print("Summary :", pol.summary())
+    print("Approve :", pol.approve())        # blocked
+    print("Submit  :", pol.submit())
+    print("Approve :", pol.approve())        # ok
+    print("Summary :", pol.summary())
+
+    print("\n" + "=" * 70)
+    print("CASE 4: Double submit on AuditableInvoice is rejected")
+    print("=" * 70)
+    print("1st :", inv.submit())              # rejected (already submitted)
+    print("Audit:", [e["action"] for e in inv.audit_trail])  # unchanged
+
+    print("\n" + "=" * 70)
+    print("CASE 5: Audit trail entries in detail")
+    print("=" * 70)
+    for i, entry in enumerate(inv.audit_trail, 1):
+        print(f"  {i}. {entry['action']:>9} | {entry['detail']} "
+              f"| {entry['at'].strftime('%H:%M:%S.%f')[:-3]}")
+
+
+if __name__ == "__main__":
+    main()
