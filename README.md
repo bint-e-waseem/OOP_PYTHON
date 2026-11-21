@@ -488,48 +488,5 @@ in the Software without restriction...
 
 ---
 
-## 📌 Notes on Customising This README
 
-| Placeholder | Replace with |
-|-------------|-------------|
-| `<your-username>` | Your GitHub handle |
-| `<Your Name>` | Your name in the MIT copyright |
-| Roadmap checkboxes | Tick as you add modules |
-| Badge URLs | Optional — remove if you don't set up CI |
-
-### Recommended companion files
-
-To make the repo truly complete, add:
-
-1. **`pyproject.toml`** — project metadata + `[dev]` extras (`pytest`, `pytest-cov`, `ruff`)
-2. **`LICENSE`** — MIT text
-3. **`CONTRIBUTING.md`** — short version of the "Contributing" section
-4. **`.github/workflows/ci.yml`** — run `pytest` + `ruff` on push
-5. **`docs/*.md`** — one file per module (the README links to them)
-
----
-
-## 🎁 Bonus: Add a GitHub Actions CI Badge
-
-Once your CI is set up, prepend this badge to the README:
-
-```markdown
-[![CI](https://github.com/<your-username>/python-oop-mastery/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/python-oop-mastery/actions/workflows/ci.yml)
-```
-
-And here's a minimal `.github/workflows/ci.yml`:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install -e ".[dev]"
-      - run: ruff check .
-      - run: pytest -v
 ```
